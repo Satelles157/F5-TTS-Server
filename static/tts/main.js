@@ -31,7 +31,6 @@ document.addEventListener('DOMContentLoaded', function() {
     let selectedRefAudio = 'basic_ref_en.wav'; // Default selection
     let refTexts = {}; // Store reference texts for each audio file
     let currentTTSController = null; // Track current TTS request for cancellation
-    let currentRequestId = null; // Track current request ID for backend cancellation
     
     // Wavesurfer instances
     let refWavesurfer = null;
@@ -568,8 +567,6 @@ document.addEventListener('DOMContentLoaded', function() {
             return;
         }
 
-        // Generate new request ID and create AbortController
-        currentRequestId = generateUUID();
         currentTTSController = new AbortController();
 
         // Show loading state
@@ -577,7 +574,7 @@ document.addEventListener('DOMContentLoaded', function() {
         hideResults();
         hideError();
 
-        console.log(`Starting TTS generation with Request ID: ${currentRequestId}`);
+        console.log('Starting TTS generation');
 
         try {
             const response = await fetch('/tts/', {
@@ -594,8 +591,7 @@ document.addEventListener('DOMContentLoaded', function() {
                     randomize_seed: randomizeSeed,
                     seed: seed,
                     ref_audio: selectedRefAudio,
-                    ref_text: refText,
-                    request_id: currentRequestId
+                    ref_text: refText
                 }),
                 signal: currentTTSController.signal
             });
@@ -656,43 +652,16 @@ document.addEventListener('DOMContentLoaded', function() {
                 showError(error.message || 'An unexpected error occurred while generating speech.');
             }
         } finally {
-            // Clear the controller, request ID, and reset button state
             currentTTSController = null;
-            currentRequestId = null;
             setLoadingState(false);
         }
     }
 
-    async function stopTTSGeneration() {
-        if (currentTTSController && currentRequestId) {
-            console.log(`Stopping TTS generation... Request ID: ${currentRequestId}`);
-            
-            // First, abort the frontend request
+    function stopTTSGeneration() {
+        if (currentTTSController) {
+            console.log('Stopping TTS generation...');
             currentTTSController.abort();
-            
-            // Then, try to cancel the backend process
-            try {
-                const response = await fetch(`/cancel-tts/${encodeURIComponent(currentRequestId)}`, {
-                    method: 'POST'
-                });
-                
-                if (response.ok) {
-                    const result = await response.json();
-                    if (result.status === 'already_completed') {
-                        console.log('TTS process already completed:', result.message);
-                    } else {
-                        console.log('Backend TTS process cancelled:', result.message);
-                    }
-                } else {
-                    console.warn('Failed to cancel backend TTS process:', response.status);
-                }
-            } catch (error) {
-                console.warn('Error cancelling backend TTS process:', error);
-            }
-            
-            // Clean up
             currentTTSController = null;
-            currentRequestId = null;
             setLoadingState(false);
         }
     }
@@ -744,13 +713,6 @@ document.addEventListener('DOMContentLoaded', function() {
 
     function hideError() {
         errorSection.style.display = 'none';
-    }
-
-    function generateUUID() {
-        return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
-            var r = Math.random() * 16 | 0, v = c == 'x' ? r : (r & 0x3 | 0x8);
-            return v.toString(16);
-        });
     }
 
     function formatFileSize(bytes) {

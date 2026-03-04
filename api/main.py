@@ -1,9 +1,7 @@
-import subprocess
+import asyncio
 import logging
 import time
 import re
-import uuid
-import threading
 from datetime import datetime
 from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.staticfiles import StaticFiles
@@ -11,24 +9,10 @@ from fastapi.responses import StreamingResponse, HTMLResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import os
-import io
-import wave
-import tempfile
 
-# Import F5-TTS preprocessing function
-try:
-    from f5_tts.infer.utils_infer import preprocess_ref_audio_text
-    F5_TTS_AVAILABLE = True
-    logger_f5 = logging.getLogger("f5_tts_preprocessing")
-except ImportError:
-    F5_TTS_AVAILABLE = False
-    logger_f5 = None
+from f5_tts.api import F5TTS
 
 project_root = os.path.dirname(os.path.abspath(os.path.dirname(__file__)))
-
-# Global dictionary to track running TTS processes
-running_processes = {}
-process_lock = threading.Lock()
 
 # Configure logging
 logging.basicConfig(
@@ -41,23 +25,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-def apply_speed_change(input_path, output_path, speed):
-    """Apply speed change to audio file using ffmpeg"""
-    try:
-        command = [
-            "ffmpeg", "-i", input_path,
-            "-filter:a", f"atempo={speed}",
-            "-y", output_path
-        ]
-        result = subprocess.run(command, check=True, capture_output=True, text=True)
-        logger.info(f"Applied speed change {speed}x using ffmpeg")
-        return True
-    except subprocess.CalledProcessError as e:
-        logger.error(f"Failed to apply speed change with ffmpeg: {e.stderr}")
-        return False
-    except FileNotFoundError:
-        logger.warning("ffmpeg not found, speed control not available")
-        return False
+# Initialize F5-TTS model once at startup
+f5tts = F5TTS(model="F5TTS_v1_Base")
 
 app = FastAPI()
 
@@ -87,7 +56,6 @@ class TTSRequest(BaseModel):
     seed: int | None = None
     ref_audio: str = "default/basic_ref_en.wav"
     ref_text: str = ""
-    request_id: str | None = None
 
 @app.get("/", response_class=HTMLResponse)
 async def read_index():
@@ -374,12 +342,9 @@ async def serve_reference_audio(file_path: str):
 async def text_to_speech(request: TTSRequest):
     start_time = time.time()
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S-%f")
-    
-    # Generate or use provided request ID
-    request_id = request.request_id or str(uuid.uuid4())
-    
+
     # Log the incoming request
-    logger.info(f"TTS Request received - ID: {timestamp}, Request ID: {request_id}")
+    logger.info(f"TTS Request received - ID: {timestamp}")
     logger.info(f"Input text: '{request.gen_text[:100]}{'...' if len(request.gen_text) > 100 else ''}'")
     logger.info(f"Text length: {len(request.gen_text)} characters")
     logger.info(f"Speed setting: {request.speed}x")
@@ -399,25 +364,22 @@ async def text_to_speech(request: TTSRequest):
     logger.info(f"Using reference audio: {ref_audio_path}")
     logger.info(f"Output file: {output_path}")
 
-    # Reference text priority: user textarea > .txt file > F5-TTS preprocessing
-    processed_ref_audio = ref_audio_path
+    # Reference text priority: user textarea > .txt file > F5-TTS auto-transcription
+    # (the API's infer() handles auto-transcription when ref_text is empty)
     processed_ref_text = request.ref_text.strip()
-    
+
     if processed_ref_text:
-        # Priority 1: User provided reference text in textarea
         logger.info("Using user-provided reference text from textarea")
     else:
-        # Priority 2: Try to find corresponding .txt file
-        # Extract just the filename without folder prefix for .txt file
+        # Try to find corresponding .txt file
         if "/" in request.ref_audio:
             folder_path, audio_filename = request.ref_audio.split("/", 1)
             base_name = os.path.splitext(audio_filename)[0]
             txt_file_path = os.path.join(project_root, "ref_audios", folder_path, f"{base_name}.txt")
         else:
-            # Legacy format
             base_name = os.path.splitext(request.ref_audio)[0]
             txt_file_path = os.path.join(project_root, "ref_audios", f"{base_name}.txt")
-        
+
         if os.path.isfile(txt_file_path):
             try:
                 with open(txt_file_path, 'r', encoding='utf-8') as f:
@@ -426,218 +388,69 @@ async def text_to_speech(request: TTSRequest):
             except Exception as e:
                 logger.warning(f"Error reading {txt_file_path}: {e}")
                 processed_ref_text = ""
-        
-        # Priority 3: Use F5-TTS preprocessing if no .txt file or reading failed
-        if not processed_ref_text and F5_TTS_AVAILABLE:
-            try:
-                logger.info("No reference text found, using F5-TTS preprocessing to generate it")
-                processed_ref_audio, processed_ref_text = preprocess_ref_audio_text(
-                    ref_audio_path, 
-                    "", 
-                    show_info=logger.info
-                )
-                logger.info(f"F5-TTS generated reference text: '{processed_ref_text[:100]}{'...' if len(processed_ref_text) > 100 else ''}'")
-            except Exception as e:
-                logger.warning(f"F5-TTS preprocessing failed: {e}, proceeding without reference text")
-                processed_ref_text = ""
-        elif not processed_ref_text:
-            logger.info("No reference text available from any source")
 
-    # Handle seed setting for reproducibility
+        if not processed_ref_text:
+            logger.info("No reference text found, API will auto-transcribe")
+
+    # Determine seed: None lets the API pick a random one
     if request.randomize_seed:
-        # Generate random seed like F5-TTS does
-        import numpy as np
-        used_seed = np.random.randint(0, 2**31 - 1)
-        logger.info(f"Generated random seed: {used_seed}")
+        seed = None
+        logger.info("Using random seed (API-generated)")
     else:
-        # Use provided seed, with validation
-        if request.seed is None or request.seed < 0 or request.seed > 2**31 - 1:
-            logger.warning(f"Invalid seed {request.seed}, using random seed instead")
-            import numpy as np
-            used_seed = np.random.randint(0, 2**31 - 1)
+        if request.seed is not None and 0 <= request.seed <= 2**31 - 1:
+            seed = request.seed
         else:
-            used_seed = request.seed
-        logger.info(f"Using specified seed: {used_seed}")
-    
-    # Set PyTorch seed for reproducibility
-    try:
-        import torch
-        torch.manual_seed(used_seed)
-        logger.info(f"Set PyTorch manual seed to: {used_seed}")
-    except ImportError:
-        logger.warning("PyTorch not available for seed setting")
+            logger.warning(f"Invalid seed {request.seed}, falling back to random")
+            seed = None
+        logger.info(f"Using seed: {seed}")
 
-    command = [
-        "f5-tts_infer-cli",
-        "--model", "F5TTS_v1_Base",
-        "--ref_audio", processed_ref_audio,
-        "--gen_text", request.gen_text,
-        "-o", "output",
-        "-w", output_filename
-    ]
-    
-    # Add reference text if available (either provided or generated)
-    if processed_ref_text:
-        command.extend(["--ref_text", processed_ref_text])
-    
-    # Add remove silence flag if enabled
-    if request.remove_silence:
-        command.append("--remove_silence")
-        logger.info("Added --remove_silence flag to F5-TTS command")
-
-    logger.info(f"Executing TTS command: {' '.join(command)}")
     logger.info("Starting TTS generation...")
-    
+
     try:
-        # Start the process using Popen so we can track and terminate it
-        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        
-        # Store the process in our tracking dictionary
-        with process_lock:
-            running_processes[request_id] = {
-                'process': process,
-                'timestamp': timestamp,
-                'start_time': start_time
-            }
-        
-        logger.info(f"TTS process started with PID: {process.pid}, Request ID: {request_id}")
-        
-        # Wait for the process to complete
-        stdout, stderr = process.communicate()
-        
-        # Remove from tracking dictionary when done
-        with process_lock:
-            if request_id in running_processes:
-                del running_processes[request_id]
-                logger.info(f"Removed completed process {request_id} from tracking")
-        
-        # Check if process was successful
-        if process.returncode != 0:
-            logger.error(f"TTS generation failed with return code {process.returncode}")
-            logger.error(f"TTS stderr: {stderr}")
-            logger.error(f"TTS stdout: {stdout}")
-            if process.returncode == -15:  # SIGTERM (process was killed)
-                raise HTTPException(status_code=499, detail="TTS generation was cancelled")
-            else:
-                raise HTTPException(status_code=500, detail=f"Error during TTS generation: {stderr}")
-        
+        loop = asyncio.get_event_loop()
+        wav, sr, spec = await loop.run_in_executor(
+            None,
+            lambda: f5tts.infer(
+                ref_file=ref_audio_path,
+                ref_text=processed_ref_text,
+                gen_text=request.gen_text,
+                nfe_step=request.nfe_steps,
+                cross_fade_duration=request.crossfade_duration,
+                speed=request.speed,
+                remove_silence=request.remove_silence,
+                file_wave=output_path,
+                seed=seed,
+                show_info=logger.info,
+            ),
+        )
+        used_seed = f5tts.seed
         logger.info("TTS generation completed successfully")
-        if stdout:
-            logger.info(f"TTS stdout: {stdout}")
-        if stderr:
-            logger.info(f"TTS stderr: {stderr}")
-            
-    except FileNotFoundError:
-        # Clean up tracking if command not found
-        with process_lock:
-            if request_id in running_processes:
-                del running_processes[request_id]
-        logger.error("f5-tts_infer-cli command not found")
-        raise HTTPException(status_code=500, detail="'f5-tts_infer-cli' not found. Ensure the virtual environment is activated and dependencies are installed correctly.")
     except Exception as e:
-        # Clean up tracking on any other exception
-        with process_lock:
-            if request_id in running_processes:
-                del running_processes[request_id]
-        raise e
+        logger.error(f"TTS generation failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Error during TTS generation: {e}")
 
     if os.path.exists(output_path):
-        final_output_path = output_path
-        
-        # Apply speed change if needed
-        if request.speed != 1.0:
-            logger.info(f"Applying speed change: {request.speed}x")
-            speed_output_path = os.path.join("output", f"{timestamp}_speed_{request.speed}.wav")
-            
-            if apply_speed_change(output_path, speed_output_path, request.speed):
-                final_output_path = speed_output_path
-                logger.info(f"Speed change applied successfully")
-            else:
-                logger.warning(f"Speed change failed, using original audio")
-        
-        # Log file details
-        file_size = os.path.getsize(final_output_path)
+        file_size = os.path.getsize(output_path)
         generation_time = time.time() - start_time
-        
+
         logger.info(f"Audio file generated successfully")
         logger.info(f"File size: {file_size} bytes ({file_size/1024:.1f} KB)")
         logger.info(f"Generation time: {generation_time:.2f} seconds")
         logger.info(f"Request {timestamp} completed successfully")
-        
+
         def iter_file():
-            with open(final_output_path, "rb") as file_like:
+            with open(output_path, "rb") as file_like:
                 yield from file_like
-        
-        # Add generation time and seed to response headers
+
         headers = {
             "X-Generation-Time": str(generation_time),
             "X-File-Size": str(file_size),
             "X-Used-Seed": str(used_seed),
-            "X-Request-ID": request_id
         }
-        
+
         return StreamingResponse(iter_file(), media_type="audio/wav", headers=headers)
     else:
         logger.error(f"Generated audio file not found at {output_path}")
         logger.error(f"Request {timestamp} failed - file not found")
-        raise HTTPException(status_code=404, detail="Generated audio file not found. The TTS command may have failed silently.")
+        raise HTTPException(status_code=404, detail="Generated audio file not found. The TTS inference may have failed silently.")
 
-@app.post("/cancel-tts/{request_id}")
-async def cancel_tts_generation(request_id: str):
-    """Cancel a running TTS generation process"""
-    
-    with process_lock:
-        if request_id not in running_processes:
-            logger.info(f"Cancel request for {request_id}: Process not found (likely already completed)")
-            return {
-                "message": "TTS request not found or already completed",
-                "request_id": request_id,
-                "status": "already_completed"
-            }
-        
-        process_info = running_processes[request_id]
-        process = process_info['process']
-        
-        try:
-            # For F5-TTS inference, use immediate force kill since SIGTERM often doesn't work during inference
-            process.kill()  # Send SIGKILL directly
-            logger.info(f"Force killed TTS process with PID: {process.pid}, Request ID: {request_id}")
-            
-            # Wait for the process to be fully terminated
-            try:
-                process.wait(timeout=2)
-                logger.info(f"TTS process {process.pid} terminated successfully")
-            except subprocess.TimeoutExpired:
-                logger.warning(f"TTS process {process.pid} did not terminate within timeout")
-            
-            # Remove from tracking dictionary
-            del running_processes[request_id]
-            
-            return {
-                "message": "TTS generation cancelled successfully",
-                "request_id": request_id
-            }
-            
-        except Exception as e:
-            logger.error(f"Error cancelling TTS process {request_id}: {e}")
-            raise HTTPException(status_code=500, detail=f"Failed to cancel TTS generation: {str(e)}")
-
-@app.get("/tts-status/{request_id}")
-async def get_tts_status(request_id: str):
-    """Get the status of a TTS generation request"""
-    
-    with process_lock:
-        if request_id in running_processes:
-            process_info = running_processes[request_id]
-            return {
-                "status": "running",
-                "request_id": request_id,
-                "pid": process_info['process'].pid,
-                "start_time": process_info['start_time'],
-                "timestamp": process_info['timestamp']
-            }
-        else:
-            return {
-                "status": "not_found",
-                "request_id": request_id
-            }
