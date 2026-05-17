@@ -25,8 +25,71 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Initialize F5-TTS model once at startup
-f5tts = F5TTS(model="F5TTS_v1_Base")
+# Idle timeout: seconds of inactivity before unloading the model (0 = disabled)
+MODEL_IDLE_TIMEOUT: int = int(os.environ.get("MODEL_IDLE_TIMEOUT", "0"))
+
+# Model state – None when unloaded
+_model_lock = asyncio.Lock()
+_f5tts: F5TTS | None = None
+_active_inferences: int = 0
+_last_request_time: float = time.time()
+
+
+def _load_model_sync() -> F5TTS:
+    logger.info("Loading F5-TTS model...")
+    model = F5TTS(model="F5TTS_v1_Base")
+    logger.info("F5-TTS model loaded")
+    return model
+
+
+def _release_model_memory():
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            logger.info("GPU cache cleared")
+    except Exception:
+        pass
+
+
+async def _ensure_model_loaded() -> None:
+    """Load the model if it is not currently in memory."""
+    global _f5tts
+    if _f5tts is not None:
+        return
+    async with _model_lock:
+        if _f5tts is None:
+            loop = asyncio.get_event_loop()
+            _f5tts = await loop.run_in_executor(None, _load_model_sync)
+
+
+async def _idle_monitor_task() -> None:
+    """Unload the model after MODEL_IDLE_TIMEOUT seconds of inactivity."""
+    global _f5tts
+    check_interval = max(5, MODEL_IDLE_TIMEOUT // 2)
+    logger.info(
+        f"Idle monitor started (timeout={MODEL_IDLE_TIMEOUT}s, "
+        f"check_interval={check_interval}s)"
+    )
+    while True:
+        await asyncio.sleep(check_interval)
+        # Fast path: skip lock acquisition when clearly not eligible
+        if _f5tts is None or _active_inferences > 0:
+            continue
+        if time.time() - _last_request_time < MODEL_IDLE_TIMEOUT:
+            continue
+        async with _model_lock:
+            if (
+                _f5tts is not None
+                and _active_inferences == 0
+                and time.time() - _last_request_time >= MODEL_IDLE_TIMEOUT
+            ):
+                logger.info(
+                    f"Model idle for >{MODEL_IDLE_TIMEOUT}s – unloading to free memory"
+                )
+                _f5tts = None
+                _release_model_memory()
+
 
 app = FastAPI()
 
@@ -42,8 +105,19 @@ app.mount("/static", StaticFiles(directory="static"), name="static")
 
 @app.on_event("startup")
 async def startup_event():
+    global _f5tts
     logger.info("F5-TTS Server starting up...")
     logger.info(f"Project root: {project_root}")
+
+    if MODEL_IDLE_TIMEOUT > 0:
+        logger.info(f"Model idle auto-unload enabled: timeout={MODEL_IDLE_TIMEOUT}s")
+        asyncio.create_task(_idle_monitor_task())
+    else:
+        logger.info("Model idle auto-unload disabled (MODEL_IDLE_TIMEOUT=0)")
+
+    # Load model at startup
+    loop = asyncio.get_event_loop()
+    _f5tts = await loop.run_in_executor(None, _load_model_sync)
     logger.info("Server ready to accept TTS requests")
 
 class TTSRequest(BaseModel):
@@ -81,30 +155,30 @@ async def read_conversation():
 async def list_reference_audios():
     """List available reference audio files from both default and custom folders"""
     ref_audios_path = os.path.join(project_root, "ref_audios")
-    
+
     if not os.path.exists(ref_audios_path):
         return {"files": [], "default": "default/basic_ref_en.wav", "ref_texts": {}}
-    
+
     try:
         # Get all audio files from both default and custom directories
         audio_extensions = {'.wav', '.mp3', '.flac', '.m4a', '.ogg'}
         files = []
         ref_texts = {}
-        
+
         # Known reference texts for common files
         known_ref_texts = {
             "default/basic_ref_en.wav": "Some call me nature, others call me mother nature.",
             "default/basic_ref_zh.wav": "对，这就是我，万人敬仰的太乙真人。"
         }
-        
+
         # Scan both default and custom folders
         folders_to_scan = ["default", "custom"]
-        
+
         for folder in folders_to_scan:
             folder_path = os.path.join(ref_audios_path, folder)
             if not os.path.exists(folder_path):
                 continue
-                
+
             for filename in os.listdir(folder_path):
                 if any(filename.lower().endswith(ext) for ext in audio_extensions):
                     file_path = os.path.join(folder_path, filename)
@@ -112,11 +186,11 @@ async def list_reference_audios():
                         # Store with folder prefix for identification
                         file_key = f"{folder}/{filename}"
                         files.append(file_key)
-                        
+
                         # Try to find corresponding .txt file first
                         base_name = os.path.splitext(filename)[0]
                         txt_file_path = os.path.join(folder_path, f"{base_name}.txt")
-                        
+
                         if os.path.isfile(txt_file_path):
                             try:
                                 with open(txt_file_path, 'r', encoding='utf-8') as f:
@@ -128,9 +202,9 @@ async def list_reference_audios():
                         else:
                             # Fall back to known reference texts
                             ref_texts[file_key] = known_ref_texts.get(file_key, "")
-        
+
         files.sort()  # Sort alphabetically
-        
+
         return {
             "files": files,
             "default": "default/basic_ref_en.wav" if "default/basic_ref_en.wav" in files else (files[0] if files else None),
@@ -143,55 +217,55 @@ async def list_reference_audios():
 @app.post("/upload-ref-audio/")
 async def upload_reference_audio(file: UploadFile = File(...)):
     """Upload a reference audio file"""
-    
+
     # Validate file type - support multiple formats as per F5-TTS
     allowed_types = ['audio/wav', 'audio/mpeg', 'audio/mp3', 'audio/flac', 'audio/x-m4a', 'audio/ogg']
     allowed_extensions = ['.wav', '.mp3', '.flac', '.m4a', '.ogg']
-    
+
     if file.content_type not in allowed_types:
         # Also check file extension as backup
         file_extension = '.' + file.filename.split('.')[-1].lower() if '.' in file.filename else ''
         if file_extension not in allowed_extensions:
             raise HTTPException(status_code=400, detail="Invalid file type. Only WAV, MP3, FLAC, M4A, and OGG files are allowed.")
-    
+
     # Validate file size (50MB limit)
     max_size = 50 * 1024 * 1024  # 50MB
     file_content = await file.read()
     if len(file_content) > max_size:
         raise HTTPException(status_code=400, detail="File size must be less than 50MB.")
-    
+
     # Sanitize filename
     safe_filename = re.sub(r'[^a-zA-Z0-9._-]', '_', file.filename)
     if not safe_filename or safe_filename.startswith('.'):
         safe_filename = f"uploaded_audio_{datetime.now().strftime('%Y%m%d_%H%M%S')}.{file.filename.split('.')[-1].lower()}"
-    
+
     # Check if file already exists and create unique name if needed
     ref_audios_path = os.path.join(project_root, "ref_audios")
     custom_folder_path = os.path.join(ref_audios_path, "custom")
     os.makedirs(custom_folder_path, exist_ok=True)
-    
+
     final_filename = safe_filename
     counter = 1
     while os.path.exists(os.path.join(custom_folder_path, final_filename)):
         name, ext = os.path.splitext(safe_filename)
         final_filename = f"{name}_{counter}{ext}"
         counter += 1
-    
+
     file_path = os.path.join(custom_folder_path, final_filename)
-    
+
     try:
         # Write file to disk
         with open(file_path, "wb") as buffer:
             buffer.write(file_content)
-        
+
         logger.info(f"Reference audio uploaded successfully: custom/{final_filename}")
-        
+
         return {
             "message": "File uploaded successfully",
             "filename": f"custom/{final_filename}",  # Return with folder prefix
             "size": len(file_content)
         }
-        
+
     except Exception as e:
         logger.error(f"Error saving uploaded file: {e}")
         # Clean up partial file if it exists
@@ -202,60 +276,60 @@ async def upload_reference_audio(file: UploadFile = File(...)):
 @app.post("/upload-text-file/")
 async def upload_text_file(file: UploadFile = File(...)):
     """Upload a text file to the ref_audios/custom folder"""
-    
+
     # Validate file type - only .txt files allowed
     if not file.filename.lower().endswith('.txt'):
         raise HTTPException(status_code=400, detail="Invalid file type. Only TXT files are allowed.")
-    
+
     # Validate file size (10MB limit for text files)
     max_size = 10 * 1024 * 1024  # 10MB
     file_content = await file.read()
     if len(file_content) > max_size:
         raise HTTPException(status_code=400, detail="File size must be less than 10MB.")
-    
+
     # Validate that it's actually text content
     try:
         text_content = file_content.decode('utf-8')
     except UnicodeDecodeError:
         raise HTTPException(status_code=400, detail="File must contain valid UTF-8 text.")
-    
+
     # Sanitize filename
     safe_filename = re.sub(r'[^a-zA-Z0-9._-]', '_', file.filename)
     if not safe_filename or safe_filename.startswith('.'):
         safe_filename = f"uploaded_text_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
-    
+
     # Ensure .txt extension
     if not safe_filename.lower().endswith('.txt'):
         safe_filename += '.txt'
-    
+
     # Check if file already exists and create unique name if needed
     ref_audios_path = os.path.join(project_root, "ref_audios")
     custom_folder_path = os.path.join(ref_audios_path, "custom")
     os.makedirs(custom_folder_path, exist_ok=True)
-    
+
     final_filename = safe_filename
     counter = 1
     while os.path.exists(os.path.join(custom_folder_path, final_filename)):
         name, ext = os.path.splitext(safe_filename)
         final_filename = f"{name}_{counter}{ext}"
         counter += 1
-    
+
     file_path = os.path.join(custom_folder_path, final_filename)
-    
+
     try:
         # Write text file to disk
         with open(file_path, "w", encoding="utf-8") as buffer:
             buffer.write(text_content)
-        
+
         logger.info(f"Text file uploaded successfully: custom/{final_filename}")
-        
+
         return {
             "message": "Text file uploaded successfully",
             "filename": final_filename,
             "content": text_content,
             "size": len(file_content)
         }
-        
+
     except Exception as e:
         logger.error(f"Error saving uploaded text file: {e}")
         # Clean up partial file if it exists
@@ -266,46 +340,46 @@ async def upload_text_file(file: UploadFile = File(...)):
 @app.delete("/delete-ref-audio/{file_path:path}")
 async def delete_reference_audio(file_path: str):
     """Delete a reference audio file (only allows deleting custom files)"""
-    
+
     # Security check - only allow deleting files from the custom folder
     if not file_path.startswith("custom/"):
         raise HTTPException(status_code=403, detail="Only custom reference audio files can be deleted")
-    
+
     # Build the actual file path
     actual_file_path = os.path.join(project_root, "ref_audios", file_path)
-    
+
     # Security check - ensure the file is within the ref_audios directory
     ref_audios_path = os.path.join(project_root, "ref_audios")
     if not os.path.abspath(actual_file_path).startswith(os.path.abspath(ref_audios_path)):
         raise HTTPException(status_code=403, detail="Access denied")
-    
+
     # Check if file exists
     if not os.path.isfile(actual_file_path):
         raise HTTPException(status_code=404, detail="Reference audio file not found")
-    
+
     # Extract just the filename for extension checking
     filename = os.path.basename(file_path)
     audio_extensions = {'.wav', '.mp3', '.flac', '.m4a', '.ogg'}
     if not any(filename.lower().endswith(ext) for ext in audio_extensions):
         raise HTTPException(status_code=400, detail="Invalid audio file format")
-    
+
     try:
         # Delete the audio file
         os.remove(actual_file_path)
         logger.info(f"Deleted reference audio file: {file_path}")
-        
+
         # Also try to delete the corresponding .txt file if it exists
         base_name = os.path.splitext(filename)[0]
         txt_file_path = os.path.join(os.path.dirname(actual_file_path), f"{base_name}.txt")
         if os.path.isfile(txt_file_path):
             os.remove(txt_file_path)
             logger.info(f"Deleted corresponding text file: custom/{base_name}.txt")
-        
+
         return {
             "message": "Reference audio file deleted successfully",
             "filename": file_path
         }
-        
+
     except Exception as e:
         logger.error(f"Error deleting reference audio file: {e}")
         raise HTTPException(status_code=500, detail="Failed to delete reference audio file")
@@ -320,27 +394,30 @@ async def serve_reference_audio(file_path: str):
     else:
         # New format with folder prefix
         actual_file_path = os.path.join(project_root, "ref_audios", file_path)
-    
+
     # Security check - ensure the file is within the ref_audios directory
     ref_audios_path = os.path.join(project_root, "ref_audios")
     if not os.path.abspath(actual_file_path).startswith(os.path.abspath(ref_audios_path)):
         raise HTTPException(status_code=403, detail="Access denied")
-    
+
     # Check if file exists and is a valid audio file
     if not os.path.isfile(actual_file_path):
         raise HTTPException(status_code=404, detail="Reference audio file not found")
-    
+
     # Extract just the filename for extension checking
     filename = os.path.basename(file_path)
     audio_extensions = {'.wav', '.mp3', '.flac', '.m4a', '.ogg'}
     if not any(filename.lower().endswith(ext) for ext in audio_extensions):
         raise HTTPException(status_code=400, detail="Invalid audio file format")
-    
+
     return FileResponse(actual_file_path, media_type="audio/wav", filename=filename)
 
 @app.post("/tts/")
 async def text_to_speech(request: TTSRequest):
+    global _active_inferences, _last_request_time
+
     start_time = time.time()
+    _last_request_time = start_time
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S-%f")
 
     # Log the incoming request
@@ -355,12 +432,12 @@ async def text_to_speech(request: TTSRequest):
     logger.info(f"Seed: {request.seed if not request.randomize_seed else 'random'}")
     logger.info(f"Reference audio: {request.ref_audio}")
     logger.info(f"Reference text: '{request.ref_text[:50]}{'...' if len(request.ref_text) > 50 else ''}'" if request.ref_text else "Reference text: (auto-transcribe)")
-    
+
     # Handle folder-aware ref audio paths
     ref_audio_path = os.path.join(project_root, "ref_audios", request.ref_audio)
     output_filename = f"{timestamp}.wav"
     output_path = os.path.join("output", output_filename)
-    
+
     logger.info(f"Using reference audio: {ref_audio_path}")
     logger.info(f"Output file: {output_path}")
 
@@ -404,13 +481,17 @@ async def text_to_speech(request: TTSRequest):
             seed = None
         logger.info(f"Using seed: {seed}")
 
+    # Ensure model is loaded (reloads automatically if it was unloaded due to idle timeout)
+    await _ensure_model_loaded()
+
     logger.info("Starting TTS generation...")
 
+    _active_inferences += 1
     try:
         loop = asyncio.get_event_loop()
         wav, sr, spec = await loop.run_in_executor(
             None,
-            lambda: f5tts.infer(
+            lambda: _f5tts.infer(
                 ref_file=ref_audio_path,
                 ref_text=processed_ref_text,
                 gen_text=request.gen_text,
@@ -423,11 +504,14 @@ async def text_to_speech(request: TTSRequest):
                 show_info=logger.info,
             ),
         )
-        used_seed = f5tts.seed
+        used_seed = _f5tts.seed
         logger.info("TTS generation completed successfully")
     except Exception as e:
         logger.error(f"TTS generation failed: {e}")
         raise HTTPException(status_code=500, detail=f"Error during TTS generation: {e}")
+    finally:
+        _active_inferences -= 1
+        _last_request_time = time.time()
 
     if os.path.exists(output_path):
         file_size = os.path.getsize(output_path)
@@ -453,4 +537,3 @@ async def text_to_speech(request: TTSRequest):
         logger.error(f"Generated audio file not found at {output_path}")
         logger.error(f"Request {timestamp} failed - file not found")
         raise HTTPException(status_code=404, detail="Generated audio file not found. The TTS inference may have failed silently.")
-
