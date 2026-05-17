@@ -1,4 +1,3 @@
-import asyncio
 import logging
 import time
 import re
@@ -10,7 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import os
 
-from f5_tts.api import F5TTS
+from api.inference_manager import InferenceManager
 
 project_root = os.path.dirname(os.path.abspath(os.path.dirname(__file__)))
 
@@ -18,82 +17,14 @@ project_root = os.path.dirname(os.path.abspath(os.path.dirname(__file__)))
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('tts_server.log'),
-        logging.StreamHandler()  # This will show logs in console too
-    ]
 )
 logger = logging.getLogger(__name__)
 
-# Idle timeout: seconds of inactivity before unloading the model (0 = disabled)
+# Seconds of inactivity before the inference worker subprocess is terminated
+# (0 = disabled, worker stays alive once started).
 MODEL_IDLE_TIMEOUT: int = int(os.environ.get("MODEL_IDLE_TIMEOUT", "0"))
 
-# Model state – None when unloaded
-_model_lock = asyncio.Lock()
-_f5tts: F5TTS | None = None
-_active_inferences: int = 0
-_last_request_time: float = time.time()
-
-
-def _load_model_sync() -> F5TTS:
-    logger.info("Loading F5-TTS model...")
-    model = F5TTS(model="F5TTS_v1_Base")
-    logger.info("F5-TTS model loaded")
-    return model
-
-
-def _release_model_memory():
-    try:
-        import gc
-        import torch
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            logger.info("GPU cache cleared")
-    except Exception:
-        logger.exception("Failed to release model memory")
-
-
-async def _ensure_model_loaded_and_pin() -> F5TTS:
-    """Return the loaded model, incrementing the active-inference counter atomically.
-
-    Caller MUST decrement _active_inferences in a finally block.
-    """
-    global _f5tts, _active_inferences
-    async with _model_lock:
-        if _f5tts is None:
-            loop = asyncio.get_running_loop()
-            _f5tts = await loop.run_in_executor(None, _load_model_sync)
-        _active_inferences += 1
-        return _f5tts
-
-
-async def _idle_monitor_task() -> None:
-    """Unload the model after MODEL_IDLE_TIMEOUT seconds of inactivity."""
-    global _f5tts
-    check_interval = max(1, min(60, MODEL_IDLE_TIMEOUT // 2 or MODEL_IDLE_TIMEOUT))
-    logger.info(
-        f"Idle monitor started (timeout={MODEL_IDLE_TIMEOUT}s, "
-        f"check_interval={check_interval}s)"
-    )
-    while True:
-        await asyncio.sleep(check_interval)
-        # Fast path: skip lock acquisition when clearly not eligible
-        if _f5tts is None or _active_inferences > 0:
-            continue
-        if time.time() - _last_request_time < MODEL_IDLE_TIMEOUT:
-            continue
-        async with _model_lock:
-            if (
-                _f5tts is not None
-                and _active_inferences == 0
-                and time.time() - _last_request_time >= MODEL_IDLE_TIMEOUT
-            ):
-                logger.info(
-                    f"Model idle for >{MODEL_IDLE_TIMEOUT}s – unloading to free memory"
-                )
-                _f5tts = None
-                _release_model_memory()
+inference_manager = InferenceManager(idle_timeout=MODEL_IDLE_TIMEOUT)
 
 
 app = FastAPI()
@@ -112,15 +43,14 @@ app.mount("/static", StaticFiles(directory="static"), name="static")
 async def startup_event():
     logger.info("F5-TTS Server starting up...")
     logger.info(f"Project root: {project_root}")
+    inference_manager.start_monitor()
+    logger.info("Server ready to accept TTS requests (worker spawns on first request)")
 
-    if MODEL_IDLE_TIMEOUT > 0:
-        logger.info(f"Model idle auto-unload enabled: timeout={MODEL_IDLE_TIMEOUT}s")
-        # Retain a strong reference so the event loop does not GC the task mid-flight.
-        app.state.idle_monitor_task = asyncio.create_task(_idle_monitor_task())
-    else:
-        logger.info("Model idle auto-unload disabled (MODEL_IDLE_TIMEOUT=0)")
 
-    logger.info("Server ready to accept TTS requests (model loads on first request)")
+@app.on_event("shutdown")
+async def shutdown_event():
+    logger.info("F5-TTS Server shutting down; stopping inference worker...")
+    await inference_manager.shutdown()
 
 class TTSRequest(BaseModel):
     gen_text: str
@@ -416,10 +346,7 @@ async def serve_reference_audio(file_path: str):
 
 @app.post("/tts/")
 async def text_to_speech(request: TTSRequest):
-    global _active_inferences, _last_request_time
-
     start_time = time.time()
-    _last_request_time = start_time
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S-%f")
 
     # Log the incoming request
@@ -483,37 +410,25 @@ async def text_to_speech(request: TTSRequest):
             seed = None
         logger.info(f"Using seed: {seed}")
 
-    # Load model if needed; increment active-inference counter atomically under the lock
-    # so the idle monitor cannot unload between the load check and inference start.
-    model = await _ensure_model_loaded_and_pin()
-
     logger.info("Starting TTS generation...")
 
     try:
-        loop = asyncio.get_running_loop()
-        wav, sr, spec = await loop.run_in_executor(
-            None,
-            lambda: model.infer(
-                ref_file=ref_audio_path,
-                ref_text=processed_ref_text,
-                gen_text=request.gen_text,
-                nfe_step=request.nfe_steps,
-                cross_fade_duration=request.crossfade_duration,
-                speed=request.speed,
-                remove_silence=request.remove_silence,
-                file_wave=output_path,
-                seed=seed,
-                show_info=logger.info,
-            ),
+        result = await inference_manager.infer(
+            ref_file=ref_audio_path,
+            ref_text=processed_ref_text,
+            gen_text=request.gen_text,
+            nfe_step=request.nfe_steps,
+            cross_fade_duration=request.crossfade_duration,
+            speed=request.speed,
+            remove_silence=request.remove_silence,
+            file_wave=output_path,
+            seed=seed,
         )
-        used_seed = model.seed
+        used_seed = result["used_seed"]
         logger.info("TTS generation completed successfully")
     except Exception as e:
         logger.error(f"TTS generation failed: {e}")
         raise HTTPException(status_code=500, detail=f"Error during TTS generation: {e}")
-    finally:
-        _active_inferences -= 1
-        _last_request_time = time.time()
 
     if os.path.exists(output_path):
         file_size = os.path.getsize(output_path)
