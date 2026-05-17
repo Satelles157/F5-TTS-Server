@@ -17,10 +17,6 @@ project_root = os.path.dirname(os.path.abspath(os.path.dirname(__file__)))
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('tts_server.log'),
-        logging.StreamHandler()  # This will show logs in console too
-    ]
 )
 logger = logging.getLogger(__name__)
 

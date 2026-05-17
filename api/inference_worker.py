@@ -14,10 +14,6 @@ def worker_main(req_q, resp_q):
     logging.basicConfig(
         level=logging.INFO,
         format='%(asctime)s - %(name)s - %(levelname)s - [worker %(process)d] %(message)s',
-        handlers=[
-            logging.FileHandler('tts_server.log'),
-            logging.StreamHandler(),
-        ],
     )
     logger = logging.getLogger("f5tts.worker")
 
