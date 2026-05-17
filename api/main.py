@@ -51,7 +51,7 @@ def _release_model_memory():
             torch.cuda.empty_cache()
             logger.info("GPU cache cleared")
     except Exception:
-        pass
+        logger.exception("Failed to release model memory")
 
 
 async def _ensure_model_loaded_and_pin() -> F5TTS:
@@ -71,7 +71,7 @@ async def _ensure_model_loaded_and_pin() -> F5TTS:
 async def _idle_monitor_task() -> None:
     """Unload the model after MODEL_IDLE_TIMEOUT seconds of inactivity."""
     global _f5tts
-    check_interval = min(60, max(5, MODEL_IDLE_TIMEOUT // 2))
+    check_interval = max(1, min(60, MODEL_IDLE_TIMEOUT // 2 or MODEL_IDLE_TIMEOUT))
     logger.info(
         f"Idle monitor started (timeout={MODEL_IDLE_TIMEOUT}s, "
         f"check_interval={check_interval}s)"
@@ -115,7 +115,8 @@ async def startup_event():
 
     if MODEL_IDLE_TIMEOUT > 0:
         logger.info(f"Model idle auto-unload enabled: timeout={MODEL_IDLE_TIMEOUT}s")
-        asyncio.create_task(_idle_monitor_task())
+        # Retain a strong reference so the event loop does not GC the task mid-flight.
+        app.state.idle_monitor_task = asyncio.create_task(_idle_monitor_task())
     else:
         logger.info("Model idle auto-unload disabled (MODEL_IDLE_TIMEOUT=0)")
 
