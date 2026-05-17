@@ -54,7 +54,7 @@ def worker_main(req_q, resp_q):
         req_id = msg["id"]
         args = msg.get("args", {})
         try:
-            model.infer(**args)
+            model.infer(show_info=logger.info, **args)
             resp_q.put({
                 "id": req_id,
                 "ok": True,
