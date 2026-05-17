@@ -44,7 +44,9 @@ def _load_model_sync() -> F5TTS:
 
 def _release_model_memory():
     try:
+        import gc
         import torch
+        gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
             logger.info("GPU cache cleared")
@@ -52,21 +54,24 @@ def _release_model_memory():
         pass
 
 
-async def _ensure_model_loaded() -> None:
-    """Load the model if it is not currently in memory."""
-    global _f5tts
-    if _f5tts is not None:
-        return
+async def _ensure_model_loaded_and_pin() -> F5TTS:
+    """Return the loaded model, incrementing the active-inference counter atomically.
+
+    Caller MUST decrement _active_inferences in a finally block.
+    """
+    global _f5tts, _active_inferences
     async with _model_lock:
         if _f5tts is None:
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
             _f5tts = await loop.run_in_executor(None, _load_model_sync)
+        _active_inferences += 1
+        return _f5tts
 
 
 async def _idle_monitor_task() -> None:
     """Unload the model after MODEL_IDLE_TIMEOUT seconds of inactivity."""
     global _f5tts
-    check_interval = max(5, MODEL_IDLE_TIMEOUT // 2)
+    check_interval = min(60, max(5, MODEL_IDLE_TIMEOUT // 2))
     logger.info(
         f"Idle monitor started (timeout={MODEL_IDLE_TIMEOUT}s, "
         f"check_interval={check_interval}s)"
@@ -116,8 +121,9 @@ async def startup_event():
         logger.info("Model idle auto-unload disabled (MODEL_IDLE_TIMEOUT=0)")
 
     # Load model at startup
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     _f5tts = await loop.run_in_executor(None, _load_model_sync)
+    _last_request_time = time.time()  # reset so idle clock starts from now, not import time
     logger.info("Server ready to accept TTS requests")
 
 class TTSRequest(BaseModel):
@@ -481,17 +487,17 @@ async def text_to_speech(request: TTSRequest):
             seed = None
         logger.info(f"Using seed: {seed}")
 
-    # Ensure model is loaded (reloads automatically if it was unloaded due to idle timeout)
-    await _ensure_model_loaded()
+    # Load model if needed; increment active-inference counter atomically under the lock
+    # so the idle monitor cannot unload between the load check and inference start.
+    model = await _ensure_model_loaded_and_pin()
 
     logger.info("Starting TTS generation...")
 
-    _active_inferences += 1
     try:
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         wav, sr, spec = await loop.run_in_executor(
             None,
-            lambda: _f5tts.infer(
+            lambda: model.infer(
                 ref_file=ref_audio_path,
                 ref_text=processed_ref_text,
                 gen_text=request.gen_text,
@@ -504,7 +510,7 @@ async def text_to_speech(request: TTSRequest):
                 show_info=logger.info,
             ),
         )
-        used_seed = _f5tts.seed
+        used_seed = model.seed
         logger.info("TTS generation completed successfully")
     except Exception as e:
         logger.error(f"TTS generation failed: {e}")
