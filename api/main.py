@@ -110,7 +110,6 @@ app.mount("/static", StaticFiles(directory="static"), name="static")
 
 @app.on_event("startup")
 async def startup_event():
-    global _f5tts
     logger.info("F5-TTS Server starting up...")
     logger.info(f"Project root: {project_root}")
 
@@ -120,11 +119,7 @@ async def startup_event():
     else:
         logger.info("Model idle auto-unload disabled (MODEL_IDLE_TIMEOUT=0)")
 
-    # Load model at startup
-    loop = asyncio.get_running_loop()
-    _f5tts = await loop.run_in_executor(None, _load_model_sync)
-    _last_request_time = time.time()  # reset so idle clock starts from now, not import time
-    logger.info("Server ready to accept TTS requests")
+    logger.info("Server ready to accept TTS requests (model loads on first request)")
 
 class TTSRequest(BaseModel):
     gen_text: str
