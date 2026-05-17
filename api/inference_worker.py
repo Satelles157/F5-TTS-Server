@@ -4,6 +4,12 @@ Run in its own process so the parent FastAPI server never imports torch
 or holds GPU/ROCm resources. The parent starts the worker on demand and
 terminates it after an idle period; killing the process is the only
 reliable way to release ROCm allocations on some configurations.
+
+IMPORTANT: this module is imported by the parent process (via
+`api.inference_manager`) to get the `worker_main` symbol for spawning.
+Any module-level import here runs in the parent too. Keep heavy
+dependencies (torch, f5_tts, anything that transitively imports them)
+inside `worker_main` so they only load in the child process.
 """
 
 import logging
@@ -54,7 +60,7 @@ def worker_main(req_q, resp_q):
         req_id = msg["id"]
         args = msg.get("args", {})
         try:
-            model.infer(show_info=logger.info, **args)
+            model.infer(show_info=lambda m: logger.info("%s", m), **args)
             resp_q.put({
                 "id": req_id,
                 "ok": True,

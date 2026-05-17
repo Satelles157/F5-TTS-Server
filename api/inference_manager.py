@@ -50,6 +50,17 @@ class InferenceManager:
 
     async def infer(self, **kwargs) -> dict:
         await self._ensure_worker()
+
+        # No awaits between this check and the future registration below:
+        # the death-handler callback can only interleave at await points,
+        # so capturing the live worker state here synchronously guarantees
+        # the future we register will be visible to the death handler if
+        # the worker dies later.
+        proc = self._proc
+        req_q = self._req_q
+        if proc is None or not proc.is_alive() or req_q is None:
+            raise RuntimeError("Worker process is not available")
+
         self._active += 1
         self._last_activity = time.time()
         try:
@@ -58,7 +69,7 @@ class InferenceManager:
             self._next_id += 1
             self._pending[req_id] = fut
             try:
-                self._req_q.put({"id": req_id, "type": "infer", "args": kwargs})
+                req_q.put({"id": req_id, "type": "infer", "args": kwargs})
             except Exception:
                 self._pending.pop(req_id, None)
                 raise
@@ -242,12 +253,13 @@ class InferenceManager:
 
     async def _force_stop_worker(self) -> None:
         proc = self._proc
+        loop = asyncio.get_running_loop()
         if proc is not None and proc.is_alive():
             proc.terminate()
-            proc.join(5)
+            await loop.run_in_executor(None, lambda: proc.join(5))
             if proc.is_alive():
                 proc.kill()
-                proc.join(5)
+                await loop.run_in_executor(None, lambda: proc.join(5))
         self._reader_stop.set()
         for q in (self._req_q, self._resp_q):
             if q is None:
